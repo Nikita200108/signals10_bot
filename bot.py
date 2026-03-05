@@ -15,7 +15,15 @@ last_alerts = {}
 async def get_top_100(ex):
     try:
         tickers = ex.fetch_tickers()
-        usdt_pairs = [t for t in tickers if t.endswith('/USDT') and 'UP' not in t and 'DOWN' not in t]
+        # Добавляем список исключений (стейблкоины)
+        exclude = ['USDC/USDT', 'FDUSD/USDT', 'DAI/USDT', 'TUSD/USDT', 'USDP/USDT', 'WBTC/USDT']
+        
+        usdt_pairs = [
+            t for t in tickers 
+            if t.endswith('/USDT') 
+            and t not in exclude 
+            and 'UP' not in t and 'DOWN' not in t
+        ]
         sorted_pairs = sorted(usdt_pairs, key=lambda x: tickers[x]['quoteVolume'], reverse=True)
         return sorted_pairs[:100]
     except: return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
@@ -56,26 +64,39 @@ async def get_btc_context(ex):
 # --- КОМАНДА /CHECK ---
 
 async def check_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔎 Полный анализ ТОП-100 (1H)... Это займет около 30 сек.")
+    await update.message.reply_text("🔎 Фильтрую мусор и анализирую ТОП-100... Подождите.")
     ex = ccxt.binance()
     coins = await get_top_100(ex)
-    results = []
+    results = {} # Используем словарь для уникальности монет
+
     for symbol in coins:
         try:
             bars = ex.fetch_ohlcv(symbol, timeframe='1h', limit=100)
             df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
             current_price = df['close'].iloc[-1]
             levels = find_levels(df)
+            
             for lvl in levels:
                 diff = abs(current_price - lvl['price']) / current_price
-                if diff <= 0.02: # Берем только те, что близко
-                    results.append({'symbol': symbol, 'diff': diff, 'price': lvl['price'], 'type': lvl['type']})
+                # Если монета уже есть в словаре, оставляем только самый близкий уровень
+                if symbol not in results or diff < results[symbol]['diff']:
+                    results[symbol] = {
+                        'diff': diff,
+                        'price': lvl['price'],
+                        'type': lvl['type']
+                    }
         except: continue
     
-    results = sorted(results, key=lambda x: x['diff'])[:10]
-    report = "📊 **ТОП-10 ГОРЯЧИХ ЗОН (Глубокий анализ):**\n\n"
-    for r in results:
-        report += f"🔹 {r['symbol']} — `{r['diff']*100:.2f}%` до {r['type']} (`{r['price']}`)\n"
+    # Сортируем и берем топ-10 уникальных монет
+    sorted_results = sorted(results.items(), key=lambda x: x[1]['diff'])[:10]
+    
+    report = "📊 **ТОП-10 ГОРЯЧИХ МОНЕТ (Без стейблкоинов):**\n\n"
+    for symbol, data in sorted_results:
+        report += f"🔹 {symbol} — `{data['diff']*100:.2f}%` до {data['type']} (`{data['price']}`)\n"
+    
+    if not sorted_results:
+        report = "📭 Пока нет подходящих уровней."
+        
     await update.message.reply_text(report, parse_mode='Markdown')
 
 # --- АВТО-МОНИТОРИНГ ---
@@ -153,4 +174,5 @@ if __name__ == '__main__':
     app.job_queue.run_once(monitor_market, when=0)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("check", check_market))
+
     app.run_polling()
