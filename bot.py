@@ -93,17 +93,32 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- МОНИТОРИНГ ---
 
+# --- НОВАЯ ФУНКЦИЯ: ОПРЕДЕЛЕНИЕ ТРЕНДА 4H ---
+async def get_trend_4h(ex, symbol):
+    try:
+        # Получаем 2 последние свечи 4-часового таймфрейма
+        bars = await asyncio.to_thread(ex.fetch_ohlcv, symbol, '4h', 2)
+        if not bars or len(bars) < 2: return "NEUTRAL"
+        # Если цена закрытия последней свечи выше предыдущей - тренд UP
+        return "UP" if bars[-1][4] > bars[0][4] else "DOWN"
+    except: return "NEUTRAL"
+
+# --- ОБНОВЛЕННЫЙ МОНИТОРИНГ ---
 async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
     ex = ccxt.binance({'enableRateLimit': True})
     while True:
         btc_status = await get_btc_context(ex)
+        
         for symbol in COINS:
             try:
+                # 1. Загружаем данные 1H для поиска уровней
                 bars = ex.fetch_ohlcv(symbol, timeframe='1h', limit=120)
                 df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
                 current_price = df['close'].iloc[-1]
-                avg_vol = df['vol'].tail(100).mean()
-                rel_vol = df['vol'].iloc[-1] / avg_vol
+                
+                # 2. ПРОВЕРЯЕМ ГЛОБАЛЬНЫЙ ТРЕНД 4H
+                trend_4h = await get_trend_4h(ex, symbol)
+                
                 levels = find_levels(df)
                 
                 for lvl in levels:
@@ -111,43 +126,54 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                     diff = abs(current_price - level_price) / current_price
                     alert_key = (symbol, level_price)
 
-                    # 1. ВНИМАНИЕ (1.0%)
+                    # Определяем логику: если мы выше уровня и тренд UP — это LONG отскок
+                    # Если ниже уровня и тренд DOWN — это SHORT отскок
+                    is_valid_long = (current_price > level_price and trend_4h == "UP")
+                    is_valid_short = (current_price < level_price and trend_4h == "DOWN")
+
+                    # 1. ВНИМАНИЕ (1.0% до уровня)
                     if 0.005 < diff <= 0.01:
                         if alert_key not in last_alerts:
-                            strength = get_level_strength(level_price, df)
-                            msg = (f"👀 **ВНИМАНИЕ (1H): {symbol}**\n"
-                                   f"До уровня: `{diff*100:.2f}%` ({level_price})\n"
-                                   f"🛡 Сила: {strength} кас. | BTC: {btc_status}\n"
-                                   f"📊 Объем: {rel_vol:.1f}x")
-                            await safe_send(context, msg)
-                            last_alerts[alert_key] = 'pre'
+                            if is_valid_long or is_valid_short:
+                                strength = get_level_strength(level_price, df)
+                                direction_text = "🟢 LONG (отскок от поддержки)" if is_valid_long else "🔴 SHORT (отскок от сопротивления)"
+                                
+                                msg = (f"👀 **ВНИМАНИЕ (1H): {symbol}**\n"
+                                       f"Направление: {direction_text}\n"
+                                       f"Тренд 4H: {trend_4h}\n"
+                                       f"До уровня: `{diff*100:.2f}%` (`{level_price}`)\n"
+                                       f"🛡 Сила: {strength} кас. | BTC: {btc_status}")
+                                await safe_send(context, msg)
+                                last_alerts[alert_key] = 'pre'
 
-                    # 2. ВХОД (0.4%)
+                    # 2. ВХОД (0.4% до уровня)
                     elif diff <= 0.004:
-                        if last_alerts.get(alert_key) != 'entry':
+                        # Входим только если было предупреждение 'pre', чтобы не спамить на каждом тике
+                        if last_alerts.get(alert_key) == 'pre':
                             side = "LONG" if current_price >= level_price else "SHORT"
-                            tp = current_price * 1.025 if side == "LONG" else current_price * 0.975
-                            sl = level_price * 0.993 if side == "LONG" else level_price * 1.007
                             
-                            msg = (f"🎯 **СИГНАЛ ВХОДА: {symbol}**\n"
-                                   f"Уровень: `{level_price}`\n"
-                                   f"📈 Направление: {side}\n"
-                                   f"✅ TP: `{tp:.4f}` | 🛑 SL: `{sl:.4f}`")
-                            await safe_send(context, msg)
-                            last_alerts[alert_key] = 'entry'
+                            # Финальная проверка: совпадает ли сигнал с трендом 4H
+                            if (side == "LONG" and trend_4h == "UP") or (side == "SHORT" and trend_4h == "DOWN"):
+                                tp = current_price * 1.025 if side == "LONG" else current_price * 0.975
+                                sl = level_price * 0.993 if side == "LONG" else level_price * 1.007
+                                
+                                msg = (f"🎯 **СИГНАЛ ВХОДА: {symbol}**\n"
+                                       f"📈 Тип: {side} (По тренду 4H)\n"
+                                       f"💰 Вход: `{current_price}`\n"
+                                       f"✅ TP: `{tp:.4f}` | 🛑 SL: `{sl:.4f}`")
+                                await safe_send(context, msg)
+                                last_alerts[alert_key] = 'entry'
 
-                    # 3. ПОДТВЕРЖДЕНИЕ ТЕНЬЮ
-                    if last_alerts.get(alert_key) == 'entry':
-                        if check_shadow_confirmation(df, "LONG" if current_price >= level_price else "SHORT"):
-                            await safe_send(context, f"🕯 **ПОДТВЕРЖДЕНО: {symbol}**\nТень свечи указывает на защиту уровня.")
-                            last_alerts[alert_key] = 'confirmed'
-
+                    # Сброс алерта, если цена ушла далеко (3%)
                     elif diff > 0.03:
                         last_alerts.pop(alert_key, None)
 
-                await asyncio.sleep(1) # Пауза между монетами
-            except: continue
-        await asyncio.sleep(60) # Пауза перед новым кругом
+                await asyncio.sleep(1) # Пауза между монетами для обхода лимитов
+            except Exception as e:
+                print(f"Ошибка мониторинга {symbol}: {e}")
+                continue
+                
+        await asyncio.sleep(60) # Ждем минуту перед следующим полным кругом
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     active_users.add(update.effective_user.id)
@@ -159,3 +185,4 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("check", check_command))
     app.run_polling()
+
