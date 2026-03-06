@@ -2,31 +2,20 @@ import os
 import ccxt
 import pandas as pd
 import asyncio
+import telegram
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # --- КОНФИГУРАЦИЯ ---
 TOKEN = os.getenv("TELEGRAM_TOKEN")
+# Список ТОП-10 (самые волатильные и ликвидные)
+COINS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT', 
+         'ADA/USDT', 'AVAX/USDT', 'DOT/USDT', 'LINK/USDT', 'MATIC/USDT', 'NEAR/USDT' ]
+
 active_users = set()
 last_alerts = {} 
 
-# --- ГЛУБОКИЙ АНАЛИЗ (ВОЗВРАЩАЕМ ВСЕ ФУНКЦИИ) ---
-
-async def get_top_100(ex):
-    try:
-        tickers = ex.fetch_tickers()
-        # Добавляем список исключений (стейблкоины)
-        exclude = ['USDC/USDT', 'FDUSD/USDT', 'DAI/USDT', 'TUSD/USDT', 'USDP/USDT', 'WBTC/USDT']
-        
-        usdt_pairs = [
-            t for t in tickers 
-            if t.endswith('/USDT') 
-            and t not in exclude 
-            and 'UP' not in t and 'DOWN' not in t
-        ]
-        sorted_pairs = sorted(usdt_pairs, key=lambda x: tickers[x]['quoteVolume'], reverse=True)
-        return sorted_pairs[:100]
-    except: return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
+# --- БЛОК ГЛУБОКОГО АНАЛИЗА ---
 
 def find_levels(df):
     levels = []
@@ -61,52 +50,54 @@ async def get_btc_context(ex):
         return "📈 UP" if btc[-1][4] > btc[0][4] else "📉 DOWN"
     except: return "---"
 
-# --- КОМАНДА /CHECK ---
+# --- ОТПРАВКА С ЗАЩИТОЙ ОТ БАНА ---
 
-async def check_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔎 Фильтрую мусор и анализирую ТОП-100... Подождите.")
+async def safe_send(context, text):
+    for user_id in active_users:
+        try:
+            await context.bot.send_message(chat_id=user_id, text=text, parse_mode='Markdown')
+            await asyncio.sleep(1) # Защитная пауза 1 сек
+        except telegram.error.RetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+        except Exception as e:
+            print(f"Ошибка отправки: {e}")
+
+# --- КОМАНДЫ ---
+
+async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔎 Быстрый скан ТОП-10 монет...")
     ex = ccxt.binance()
-    coins = await get_top_100(ex)
-    results = {} # Используем словарь для уникальности монет
-
-    for symbol in coins:
+    report = "📊 **СТАТУС ПО УРОВНЯМ (1H):**\n\n"
+    
+    for symbol in COINS:
         try:
             bars = ex.fetch_ohlcv(symbol, timeframe='1h', limit=100)
             df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
             current_price = df['close'].iloc[-1]
             levels = find_levels(df)
             
+            # Ищем самый близкий уровень
+            closest = None
+            min_diff = 100
             for lvl in levels:
                 diff = abs(current_price - lvl['price']) / current_price
-                # Если монета уже есть в словаре, оставляем только самый близкий уровень
-                if symbol not in results or diff < results[symbol]['diff']:
-                    results[symbol] = {
-                        'diff': diff,
-                        'price': lvl['price'],
-                        'type': lvl['type']
-                    }
+                if diff < min_diff:
+                    min_diff = diff
+                    closest = lvl
+            
+            if closest:
+                report += f"🔹 {symbol}: `{min_diff*100:.2f}%` до {closest['type']}\n"
         except: continue
     
-    # Сортируем и берем топ-10 уникальных монет
-    sorted_results = sorted(results.items(), key=lambda x: x[1]['diff'])[:10]
-    
-    report = "📊 **ТОП-10 ГОРЯЧИХ МОНЕТ (Без стейблкоинов):**\n\n"
-    for symbol, data in sorted_results:
-        report += f"🔹 {symbol} — `{data['diff']*100:.2f}%` до {data['type']} (`{data['price']}`)\n"
-    
-    if not sorted_results:
-        report = "📭 Пока нет подходящих уровней."
-        
     await update.message.reply_text(report, parse_mode='Markdown')
 
-# --- АВТО-МОНИТОРИНГ ---
+# --- МОНИТОРИНГ ---
 
 async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
     ex = ccxt.binance({'enableRateLimit': True})
     while True:
-        coins = await get_top_100(ex)
         btc_status = await get_btc_context(ex)
-        for symbol in coins:
+        for symbol in COINS:
             try:
                 bars = ex.fetch_ohlcv(symbol, timeframe='1h', limit=120)
                 df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
@@ -128,7 +119,7 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                                    f"До уровня: `{diff*100:.2f}%` ({level_price})\n"
                                    f"🛡 Сила: {strength} кас. | BTC: {btc_status}\n"
                                    f"📊 Объем: {rel_vol:.1f}x")
-                            await broadcast(context, msg)
+                            await safe_send(context, msg)
                             last_alerts[alert_key] = 'pre'
 
                     # 2. ВХОД (0.4%)
@@ -140,39 +131,31 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
                             
                             msg = (f"🎯 **СИГНАЛ ВХОДА: {symbol}**\n"
                                    f"Уровень: `{level_price}`\n"
-                                   f"Тип: {lvl['type']}\n\n"
                                    f"📈 Направление: {side}\n"
-                                   f"✅ TP: `{tp:.4f}` | 🛑 SL: `{sl:.4f}`\n"
-                                   f"🛡 Сила уровня: {get_level_strength(level_price, df)} касаний")
-                            await broadcast(context, msg)
+                                   f"✅ TP: `{tp:.4f}` | 🛑 SL: `{sl:.4f}`")
+                            await safe_send(context, msg)
                             last_alerts[alert_key] = 'entry'
 
                     # 3. ПОДТВЕРЖДЕНИЕ ТЕНЬЮ
                     if last_alerts.get(alert_key) == 'entry':
                         if check_shadow_confirmation(df, "LONG" if current_price >= level_price else "SHORT"):
-                            await broadcast(context, f"🕯 **ОТ СКОК ПОДТВЕРЖДЕН: {symbol}**\nНа уровне появилась тень. Покупатель/Продавец защищает зону.")
+                            await safe_send(context, f"🕯 **ПОДТВЕРЖДЕНО: {symbol}**\nТень свечи указывает на защиту уровня.")
                             last_alerts[alert_key] = 'confirmed'
 
                     elif diff > 0.03:
                         last_alerts.pop(alert_key, None)
 
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(1) # Пауза между монетами
             except: continue
-        await asyncio.sleep(40)
-
-async def broadcast(context, text):
-    for user_id in active_users:
-        try: await context.bot.send_message(chat_id=user_id, text=text, parse_mode='Markdown')
-        except: pass
+        await asyncio.sleep(60) # Пауза перед новым кругом
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     active_users.add(update.effective_user.id)
-    await update.message.reply_text("🔥 **УЛЬТРА-СКАНЕР ТОП-100 (1H) ЗАПУЩЕН**\n\nЯ анализирую: Уровни, Силу, Объем, Тени и BTC.")
+    await update.message.reply_text("🚀 Снайпер ТОП-10 запущен. Только элитные сигналы.")
 
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TOKEN).build()
     app.job_queue.run_once(monitor_market, when=0)
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("check", check_market))
-
+    app.add_handler(CommandHandler("check", check_command))
     app.run_polling()
